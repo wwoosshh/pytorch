@@ -545,6 +545,146 @@ class TestIterators(torch._dynamo.test_case.TestCase):
         self.assertIs(type(it), type(iter(())))
         self.assertIsNot(type(it), type(iter([])))
 
+    def test_list_reverseiterator_not_a_list_iterator(self):
+        """list_reverseiterator must not subclass ListIteratorVariable (CPython parity)."""
+        from torch._dynamo.variables.lists import (
+            ListIteratorVariable,
+            ListReverseIteratorVariable,
+        )
+
+        self.assertFalse(issubclass(ListReverseIteratorVariable, ListIteratorVariable))
+        self.assertIs(ListReverseIteratorVariable._cpython_type, type(reversed([])))
+        self.assertIs(ListIteratorVariable._cpython_type, type(iter([])))
+
+    @make_dynamo_test
+    def test_yield_from_list_reverseiterator(self):
+        """yield from over a list_reverseiterator."""
+
+        def gen():
+            yield from reversed([1, 2, 3])
+
+        self.assertEqual(list(gen()), [3, 2, 1])
+
+    @make_dynamo_test
+    def test_list_reverseiterator_python_type(self):
+        """type(reversed(list)) inside compile must be list_reverseiterator."""
+        it = reversed([1, 2, 3])
+        self.assertIs(type(it), type(reversed([])))
+        self.assertIsNot(type(it), type(iter([])))
+
+    def test_list_reverseiterator_arg_iter(self):
+        """Issue #196212: torch.compile tracing iter() on list_reverseiterator input."""
+
+        def fn(it, x):
+            res = x
+            for val in iter(it):
+                res = res * val
+            return res
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.tensor(2)
+        it = reversed([3, 5, 7])
+        self.assertEqual(opt_fn(it, x), torch.tensor(210))
+
+    def test_list_reverseiterator_arg_loop(self):
+        """Iterating directly over list_reverseiterator argument in torch.compile."""
+
+        def fn(it, x):
+            res = x
+            for val in it:
+                res = res + val
+            return res
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.tensor(5)
+        it = reversed([10, 20, 30])
+        self.assertEqual(opt_fn(it, x), torch.tensor(65))
+
+    def test_list_reverseiterator_arg_guards(self):
+        """Guard validation and recompilation for list_reverseiterator arguments."""
+
+        def fn(it, x):
+            tensors = list(it)
+            return x + sum(tensors)
+
+        cnt = torch._dynamo.testing.CompileCounter()
+        opt_fn = torch.compile(fn, backend=cnt, fullgraph=True)
+
+        t1 = torch.tensor(1)
+        t2 = torch.tensor(2)
+        t3 = torch.tensor(3)
+        t4 = torch.tensor(4)
+        t5 = torch.tensor(5)
+
+        # First call: compiles 1 frame
+        self.assertEqual(opt_fn(reversed([t1, t2]), torch.tensor(10)), torch.tensor(13))
+        self.assertEqual(cnt.frame_count, 1)
+
+        # Same length, different tensor values: no recompile
+        self.assertEqual(opt_fn(reversed([t3, t4]), torch.tensor(10)), torch.tensor(17))
+        self.assertEqual(cnt.frame_count, 1)
+
+        # Different length: triggers LIST_REVERSEITERATOR_LEN recompile (frame_count becomes 2)
+        self.assertEqual(
+            opt_fn(reversed([t1, t2, t5]), torch.tensor(10)), torch.tensor(18)
+        )
+        self.assertEqual(cnt.frame_count, 2)
+
+    def test_list_reverseiterator_partially_consumed_arg(self):
+        """Exercises start - index offset arithmetic in list_reverseiterator_getitem."""
+
+        def fn(it, x):
+            res = x
+            for val in it:
+                res = res + val
+            return res
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        it = reversed([10, 20, 30, 40])
+        next(it)  # start is now 2, not 3 (consumed 40; remaining: 30, 20, 10)
+        self.assertEqual(opt_fn(it, torch.tensor(0)), torch.tensor(60))
+
+    def test_list_reverseiterator_mutation_side_effects(self):
+        """Caller-side iterator advancement via _codegen_list_iterator_mutation."""
+
+        def fn(it, x):
+            a = next(it)
+            b = next(it)
+            return x + a + b
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        it = reversed([1, 2, 3, 4, 5])
+        res = opt_fn(it, torch.tensor(0))
+        self.assertEqual(res, torch.tensor(5 + 4))
+        # Verify caller-side iterator was advanced by 2
+        self.assertEqual(list(it), [3, 2, 1])
+
+    def test_list_reverseiterator_empty_and_exhausted(self):
+        """Boundary cases: empty list reversed and fully exhausted reverse iterator."""
+
+        def fn(it, x):
+            return x + sum(it)
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        # Empty list reversed
+        self.assertEqual(opt_fn(reversed([]), torch.tensor(5)), torch.tensor(5))
+
+        # Fully exhausted iterator
+        it = reversed([1, 2, 3])
+        list(it)  # consume completely
+        self.assertEqual(opt_fn(it, torch.tensor(10)), torch.tensor(10))
+
+    def test_tuple_does_not_have_reversed_slot(self):
+        """In CPython tuple has no __reversed__ slot; TupleVariable must not expose it."""
+        self.assertFalse(hasattr((1, 2), "__reversed__"))
+
+        def fn(t):
+            return hasattr(t, "__reversed__")
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertFalse(opt_fn((1, 2)))
+        self.assertFalse(opt_fn(torch.Size([2, 3])))
+
     @make_dynamo_test
     def test_comprehensions_with_iterator(self):
         """Test different comprehension types with iterators"""
