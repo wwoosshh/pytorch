@@ -5881,7 +5881,9 @@ class AOTInductorTestsTemplate:
 
         model = Model().to(self.device)
         input1 = (torch.rand(100, device=self.device),)
-        input2 = (torch.rand(2099, device=self.device),)
+        # Keep the reshape itself valid so this exercises the exported runtime
+        # assertion even when reshape is lowered as an extern fallback.
+        input2 = (torch.rand(200, device=self.device),)
         dynamic_shapes = {
             "x": {0: torch.export.Dim.DYNAMIC},
         }
@@ -6498,10 +6500,9 @@ class AOTInductorTestsTemplate:
         a = torch.randn(batch, M, K, device=self.device)
         example_inputs = (a,)
 
-        if self.device == "cpu" and self.allow_stack_allocation:
-            # ArrayRef stack allocation does not support the transpose/addmm
-            # C shims used by this model, so the graph is lowered to the
-            # reshape fallback plus a C++ fused kernel instead.
+        if self.device == "cpu" and config.fallback_by_default:
+            # Lite mode lowers this graph to the reshape fallback plus a C++
+            # fused kernel instead of the transpose/addmm C shims.
             kernel_calls = [
                 ("aoti_torch_cpu_reshape", 1),
                 ("cpp_fused_0", 1),
@@ -6540,7 +6541,7 @@ class AOTInductorTestsTemplate:
         # test printing selected kernel's tensor values codegen
         filtered_kernel_name, filtered_kernel_count = (
             ("cpp_fused_0", 1)
-            if self.device == "cpu" and self.allow_stack_allocation
+            if self.device == "cpu" and config.fallback_by_default
             else (f"aoti_torch_{self.device}_addmm_out", 2)
         )
         with config.patch(
@@ -6602,9 +6603,9 @@ class AOTInductorTestsTemplate:
         example_inputs = (a,)
         if self.device == GPU_TYPE:
             kernel_call_patterns = [f"aoti_torch_{GPU_TYPE}_addmm_out"]
-        elif self.allow_stack_allocation:
-            # The ArrayRef path lowers this graph to an extern reshape and a
-            # C++ fused kernel. The graph id is assigned dynamically.
+        elif self.device == "cpu" and config.fallback_by_default:
+            # Lite mode lowers this graph to an extern reshape and a C++ fused
+            # kernel. The graph id is assigned dynamically.
             kernel_call_patterns = [
                 "aoti_torch_cpu_reshape",
                 r"graph_\d+_cpp_fused_0",
@@ -6627,7 +6628,7 @@ class AOTInductorTestsTemplate:
                     FileCheck().check_not("KernelContextGuard").run(code)
                 for kernel_call_pattern in kernel_call_patterns:
                     FileCheck().check_regex(
-                        rf'RAIIAtenRecordFunctionHandle .*\\("{kernel_call_pattern}"'
+                        rf'RAIIAtenRecordFunctionHandle .*\("{kernel_call_pattern}"'
                     ).run(code)
             else:
                 FileCheck().check_not("RAIIAtenRecordFunctionHandle").check_not(
@@ -6639,6 +6640,7 @@ class AOTInductorTestsTemplate:
     @unittest.skipIf(
         config.triton.native_matmul, "different kernel name when native matmul"
     )
+    @skip_if_lite_mode("the addmm/mm shim profiling path is absent")
     @unittest.skipIf(
         sys.platform not in ["linux", "win32"],
         "enable_kernel_profile only supported on linux and win32",
@@ -6753,14 +6755,13 @@ class AOTInductorTestsTemplate:
                 AOTIRunnerUtil.compile, Model(), example_inputs
             )
             # The handle must carry the logical transposed shape, not the
-            # original base buffer. The non-ArrayRef path records a
-            # reinterpret_tensor_wrapper(...) handle directly, while the
-            # stack-allocation ArrayRef path materializes the transpose into a
-            # temporary bufN first and records that handle instead.
+            # original base buffer. Normal codegen records a
+            # reinterpret_tensor_wrapper(...) handle directly, while lite mode
+            # materializes the transpose into a temporary bufN first.
             expected_input_0 = (
                 r"aoti_torch_tensor_to_ivalue\(buf0, "
                 r"&tmp_aoti_torch_\w*scaled_dot_product\w*_input_0\)"
-                if self.allow_stack_allocation
+                if config.fallback_by_default
                 else (
                     r"aoti_torch_tensor_to_ivalue\("
                     r"wrap_with_raii_handle_if_needed\(reinterpret_tensor_wrapper.*"
@@ -6802,13 +6803,18 @@ class AOTInductorTestsTemplate:
             # input: the kernel's args collapse the whole list into a single
             # entry, so a positional args lookup cannot reach index 3.
             FileCheck().check("tmp_aoti_torch_cpu_cat_input_3").run(code)
-            # The IValue variable name is built from the loop index alone, so
-            # pin the handle expression too: the slices must be recorded as
-            # reinterpret views rather than their base buffers.
-            FileCheck().check(
-                "aoti_torch_tensor_to_ivalue(wrap_with_raii_handle_if_needed("
-                "reinterpret_tensor_wrapper"
-            ).run(code)
+            # Pin the fourth input's handle expression too. Normal codegen
+            # records its logical slice view; lite mode materializes each slice
+            # before the cat fallback and records the corresponding buffer.
+            expected_input_3 = (
+                ("aoti_torch_tensor_to_ivalue(buf3, &tmp_aoti_torch_cpu_cat_input_3)")
+                if config.fallback_by_default
+                else (
+                    "aoti_torch_tensor_to_ivalue(wrap_with_raii_handle_if_needed("
+                    "reinterpret_tensor_wrapper"
+                )
+            )
+            FileCheck().check(expected_input_3).run(code)
             FileCheck().check("RAIIAtenRecordFunctionHandle").run(code)
 
             self.check_model(Model(), example_inputs)
@@ -7143,9 +7149,9 @@ class AOTInductorTestsTemplate:
 
         example_inputs = (torch.randn(4, 4, device="cpu"),)
 
-        if self.allow_stack_allocation:
-            # The ArrayRef path uses a separate C++ kernel and an extern
-            # mul.Tensor fallback because sqrt has no ArrayRef C shim.
+        if config.fallback_by_default:
+            # Lite mode uses a separate C++ kernel and an extern mul.Tensor
+            # fallback because sqrt has no C shim.
             kernel_calls = [
                 ("cpp_fused_0", 1),
                 ("aoti_torch_cpu_mul_Tensor", 3),

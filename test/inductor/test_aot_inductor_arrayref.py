@@ -332,6 +332,11 @@ CPU_TEST_FAILURES = {
     "test_seq": fail_stack_allocation(is_skip=True),
 }
 
+# The all-fallback lite-mode lowering avoids the ArrayRef assignment failure
+# covered by this expected-failure entry, so keep the now-passing test enabled.
+if config.fallback_by_default:
+    CPU_TEST_FAILURES.pop("test_cond_unbacked_symint_predicate")
+
 
 class AOTInductorTestABICompatibleCpuWithStackAllocation(TestCase):
     device = "cpu"
