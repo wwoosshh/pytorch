@@ -1148,7 +1148,8 @@ def test_distributed(test_module, test_directory, options):
                     test_module,
                     test_directory,
                     options,
-                    extra_unittest_args=["--subprocess"],
+                    # Each test already creates fresh rank processes.
+                    extra_unittest_args=[],
                 )
             if return_code != 0:
                 return return_code
@@ -1416,7 +1417,6 @@ CUSTOM_HANDLERS = {
     "distributed/test_c10d_ucc": run_test_with_subprocess,
     "distributed/test_c10d_common": run_test_with_subprocess,
     "distributed/test_c10d_spawn_gloo": run_test_with_subprocess,
-    "distributed/test_c10d_spawn_nccl": run_test_with_subprocess,
     "distributed/test_c10d_spawn_ucc": run_test_with_subprocess,
     "distributed/test_pg_wrapper": run_test_with_subprocess,
     "distributed/rpc/test_faulty_agent": run_test_with_subprocess,
